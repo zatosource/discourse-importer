@@ -1,0 +1,7 @@
+#!/usr/bin/env python
+
+# Part of Zato - Open-Source ESB, SOA, REST, APIs and Cloud Integrations in Python
+# https://zato.io
+
+from zato.discourse_importer.cli import main
+main()
