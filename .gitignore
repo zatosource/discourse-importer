@@ -1,2 +1,3 @@
 *.pyc
+discourse-importer
 src/zato_discourse_importer.egg-info
