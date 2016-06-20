@@ -11,11 +11,12 @@ https://zato.io
 from __future__ import absolute_import, division, print_function, unicode_literals
 
 # stdlib
+import operator
 import os
 import sys
 from base64 import decodestring as b64decode
 from email.header import decode_header
-from email.utils import parseaddr
+from email.utils import parseaddr, parsedate
 from json import loads
 from logging import getLogger
 from http.client import OK
@@ -159,8 +160,12 @@ class Message(object):
         self.from_ = ''
         self.subject = ''
         self.body = ''
-        self.children = {}
+        self.children = []
         self.is_top_level = False
+        self.date = ''
+
+    def __lt__(self, other):
+        return self.date < other.date
 
     def get_body(self, msg, list_footer_start):
         body = msg.get_payload()
@@ -181,10 +186,16 @@ class Message(object):
         if skip_subject and skip_subject in subject:
             return
 
-        subject = subject.replace('[Zato-discuss] ', '')
+        try:
+            subject = subject.replace('[Zato-discuss] ', '')
+        except AttributeError:
+            return
+
+        subject = ' '.join(subject.split())
 
         msg = Message()
         msg.id = raw['Message-ID']
+        msg.date = parsedate(raw['Date'])
         msg.subject = '(Migrated) {}'.format(subject)
         msg.from_ = from_
         msg.is_top_level = 'In-Reply-To' not in raw
@@ -266,8 +277,8 @@ class Importer(object):
 
         for msg in self.mbox:
             _, from_ = self._get_name_from(msg)
-            if from_ not in self.mbox_users:
-                continue
+            #if from_ not in self.mbox_users:
+            #    continue
 
             msg = Message.from_mbox_object(msg, from_, self.list_footer_start, self.skip_subject)
             if msg:
@@ -284,8 +295,10 @@ class Importer(object):
                 for ref in refs:
                     if ref in self.mbox_messages:
                         top_level_id = ref
-                        children = self.mbox_messages[top_level_id].children.setdefault(top_level_id, [])
-                        children.append(Message.from_mbox_object(msg, from_, self.list_footer_start, self.skip_subject))
+                        children = self.mbox_messages[top_level_id].children
+                        child_msg = Message.from_mbox_object(msg, from_, self.list_footer_start, self.skip_subject)
+                        if child_msg:
+                            children.append(child_msg)
 
 # ################################################################################################################################
 
@@ -363,29 +376,34 @@ class Importer(object):
         x = 0
         until = 5#len(self.mbox_messages)
 
-
-        for msg_id, msg in self.mbox_messages.items():
-
-            if not msg.is_top_level:
-                continue
+        for msg_id in sorted(self.mbox_messages, key=self.mbox_messages.get):
 
             if x == until:
                 break
             x += 1
 
-            self.client.create_topic(self.category_id, msg.subject, msg.body)
+            msg = self.mbox_messages[msg_id]
+            if msg.is_top_level:
+                print(msg.subject)
+
+                for child in sorted(msg.children, key=lambda x: x.date):
+                    print('  ', child.date)
+
+                #self.client.create_topic(self.category_id, msg.subject, msg.body)
 
 # ################################################################################################################################
 
     def run(self):
-        self.client.connect()
-        self.client.ping()
+        #self.client.connect()
+        #self.client.ping()
         self.read_mbox()
 
+        '''
         if self.set_missing_users():
             self.add_missing_users()
 
         self.create_topics()
+        '''
 
 # ################################################################################################################################
 
