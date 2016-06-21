@@ -40,7 +40,7 @@ logger = getLogger(__name__)
 
 # ################################################################################################################################
 
-rand_suffix = range(1, 5)
+rand_suffix = range(1, 100)
 
 # ################################################################################################################################
 
@@ -136,8 +136,8 @@ class Client(object):
 
 # ################################################################################################################################
 
-    def create_topic(self, category_id, title, raw):
-        request = urlencode({
+    def create_topic(self, category_id, title, raw, topic_id=None):
+        request = {
             'archetype': 'regular',
             'category': category_id,
             'composer_open_duration_msecs': 22602,
@@ -146,9 +146,12 @@ class Client(object):
             'raw': raw,
             'title': title,
             'typing_duration_msecs': 6600,
-        })
+        }
 
-        response = self._post('/posts', data=request)
+        if topic_id:
+            request['topic_id'] = topic_id
+
+        return self._post('/posts', data=urlencode(request)).get('post', {}).get('topic_id')
 
 # ################################################################################################################################
 
@@ -167,17 +170,25 @@ class Message(object):
     def __lt__(self, other):
         return self.date < other.date
 
+    def _b64decode(self, msg, body):
+        if msg.get('Content-Transfer-Encoding') == 'base64':
+            return b64decode(bytes(body, 'utf8')).decode('utf8', 'ignore')
+        else:
+            return body
+
     def get_body(self, msg, list_footer_start):
         body = msg.get_payload()
+        body = self._b64decode(msg, body)
 
-        if msg.get('Content-Transfer-Encoding') == 'base64':
-            body = b64decode(bytes(body, 'utf8')).decode('utf8')
+        # Handle multipart messages
+        while isinstance(body, list):
+            sub_msg = body[0]
+            body = self._b64decode(sub_msg, sub_msg.get_payload())
 
-        # Skip multipart messages
-        if isinstance(body, list):
-            return
-
-        return body.split(list_footer_start)[0]
+        body = body.split(list_footer_start)[0]
+        body = body.split('cheers,')[0]
+        body = body.split('-- ')[0]
+        return body.strip()
 
     @staticmethod
     def from_mbox_object(raw, from_, list_footer_start, skip_subject):
@@ -205,6 +216,10 @@ class Message(object):
         if not msg.body:
             return
 
+        if msg.is_top_level:
+            msg.body = '\n<b>(This message has been automatically imported from the retired mailing list)</b>'\
+                          '\n\n{}'.format(msg.body)
+
         return msg
 
 # ################################################################################################################################
@@ -221,7 +236,7 @@ class Importer(object):
     """ Imports mbox files to Discourse, creating users on fly if needed.
     """
     def __init__(self, mbox_path, address, username, api_key, verify_tls, list_footer_start, emails_ignore, emails_require,
-            category_id, skip_subject):
+            emails_add, category_id, skip_subject):
         self.mbox_path = os.path.abspath(os.path.expanduser(mbox_path))
         self.mbox = mbox(self.mbox_path)
         self.address = address
@@ -231,6 +246,7 @@ class Importer(object):
         self.list_footer_start = list_footer_start
         self.emails_ignore = emails_ignore
         self.emails_require = emails_require
+        self.emails_add = emails_add
         self.category_id = category_id
         self.skip_subject = skip_subject
         self.missing_users = set()
@@ -277,8 +293,8 @@ class Importer(object):
 
         for msg in self.mbox:
             _, from_ = self._get_name_from(msg)
-            #if from_ not in self.mbox_users:
-            #    continue
+            if from_ not in self.mbox_users:
+                continue
 
             msg = Message.from_mbox_object(msg, from_, self.list_footer_start, self.skip_subject)
             if msg:
@@ -287,10 +303,10 @@ class Importer(object):
         # Third pass - collect children messages
         for msg in self.mbox:
             refs = msg['References']
-            from_ = self._get_name_from(msg)
             if refs:
                 refs = refs.split('\n')
                 refs = [elem.strip() for elem in refs]
+                from_ = self._get_name_from(msg)
 
                 for ref in refs:
                     if ref in self.mbox_messages:
@@ -335,7 +351,6 @@ class Importer(object):
         new = []
         duplicates = []
         used = set()
-        credentials = '\n\n'
 
         for item in self.missing_users:
             new.append(self._get_username(item))
@@ -363,47 +378,35 @@ class Importer(object):
             password = uuid4().hex
 
             self.client.create_user(name, user_name, item, password)
-            credentials += '{} / {}\n'.format(user_name, password)
-
-        credentials += '\n\n'
-
-        logger.info(credentials)
 
 # ################################################################################################################################
 
     def create_topics(self):
 
-        x = 0
-        until = 5#len(self.mbox_messages)
-
         for msg_id in sorted(self.mbox_messages, key=self.mbox_messages.get):
 
-            if x == until:
-                break
-            x += 1
-
             msg = self.mbox_messages[msg_id]
+
             if msg.is_top_level:
-                print(msg.subject)
+                logger.info('Creating %s', msg.subject)
+
+                topic_id = self.client.create_topic(self.category_id, msg.subject, msg.body)
 
                 for child in sorted(msg.children, key=lambda x: x.date):
-                    print('  ', child.date)
-
-                #self.client.create_topic(self.category_id, msg.subject, msg.body)
+                    self.client.create_topic(self.category_id, child.subject, child.body, topic_id)
 
 # ################################################################################################################################
 
     def run(self):
-        #self.client.connect()
-        #self.client.ping()
+
+        self.client.connect()
+        self.client.ping()
         self.read_mbox()
 
-        '''
         if self.set_missing_users():
             self.add_missing_users()
 
         self.create_topics()
-        '''
 
 # ################################################################################################################################
 
@@ -418,7 +421,8 @@ def handle(config_path):
             sys.exit(1)
 
     imp = Importer(config.mbox_path, config.address, config.username, config.api_key, config.verify_tls,
-        config.list_footer_start, config.emails_ignore, config.emails_require, config.category_id, config.skip_subject)
+        config.list_footer_start, config.emails_ignore, config.emails_require, config.emails_add,
+        config.category_id, config.skip_subject)
     imp.run()
 
 # ################################################################################################################################
